@@ -14,8 +14,6 @@ from googleapiclient.discovery import build
 import hashlib
 import asyncio
 import edge_tts
-import vertexai
-from vertexai.preview.vision_models import ImageGenerationModel
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -399,19 +397,24 @@ def save_book_knowledge(titulo, aprendizajes_clave):
 def generate_creative_image(prompt_visual):
     """
     Motor de Arte Digital (Nano Banana / Imagen 3 FAST).
-    Versión: imagen-3.0-fast-generate-001 (Velocidad y Estabilidad).
+    OPTIMIZADO: Carga las librerías SOLO cuando se necesitan (Lazy Import).
     """
+    
+    # 1. IMPORTACIÓN TÁCTICA (Aquí es donde ganamos velocidad de inicio)
+    # Al ponerlo aquí dentro, la App no se traba al arrancar.
+    import vertexai
+    from vertexai.preview.vision_models import ImageGenerationModel
+
     print(f"🎨 Iniciando generación con Imagen 3 Fast: {prompt_visual[:50]}...")
     
     try:
-        # 1. Configuración de Región (Imagen 3 vive estrictamente en us-central1)
+        # 2. Configuración de Región
         vertexai.init(location="us-central1")
         
-        # 2. Cargamos el modelo IMAGEN 3 FAST
-        # Este modelo es ideal para respuestas rápidas y tiene menos bloqueos de cuota
+        # 3. Cargamos el modelo
         model = ImageGenerationModel.from_pretrained("imagen-3.0-fast-generate-001")
         
-        with st.spinner("⚡ Revelando fotografía a alta velocidad (Imagen 3 Fast)..."):
+        with st.spinner("⚡ Revelando fotografía a alta velocidad..."):
             images = model.generate_images(
                 prompt=prompt_visual,
                 number_of_images=1,
@@ -428,8 +431,7 @@ def generate_creative_image(prompt_visual):
                 return "⚠️ El motor no devolvió datos."
 
     except Exception as e:
-        error_msg = str(e)
-        print(f"❌ Error Generación: {error_msg}")
+        return f"❌ Error Técnico: {str(e)}"
         
         # PLAN B: Si falla, devolvemos el Prompt
         return (
@@ -991,3 +993,4 @@ if process_interaction:
 if st.button("🧪 PROBAR CONEXIÓN CALENDARIO", key="boton_prueba_clon"):
 
     test_calendar_connection()
+
