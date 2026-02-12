@@ -8,3 +8,4 @@ pydub
 Pillow
 numpy
 pypdf
+streamlit-mic-recorder
