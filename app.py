@@ -16,6 +16,9 @@ import asyncio
 import edge_tts
 import vertexai
 from vertexai.preview.vision_models import ImageGenerationModel
+import firebase_admin
+from firebase_admin import credentials, firestore
+
 
 # ---------------------------------------------------------
 # 1. CONFIGURACIÓN INICIAL
@@ -146,25 +149,35 @@ def gestor_de_proyectos():
                 st.error(f"Error al guardar: {e}")
                 
 # ---------------------------------------------------------
-# 4. BASE DE DATOS (FIRESTORE)
+# 4. BASE DE DATOS (FIRESTORE) - OPTIMIZADO
 # ---------------------------------------------------------
-db = None
-doc_ref = None
-DOCUMENT_ID = "memoria_jarvis_v2"
 
-try:
-    # ¡LA CLAVE!: Usamos la función de conexión nativa que arreglamos antes
-    creds = get_google_credentials()
-    
-    if creds:
-        # Conectamos Firestore usando tus credenciales de Google
-        db = firestore.Client(credentials=creds, project="jarvis-ia-v1", database="firestore")
+# A. Función de Conexión con CACHÉ (El secreto para que no falle el arranque)
+@st.cache_resource
+def get_firestore_connection():
+    try:
+        creds = get_google_credentials() # Tu función actual
+        if creds:
+            # Conectamos una sola vez y guardamos la conexión en memoria
+            return firestore.Client(credentials=creds, project="jarvis-ia-v1", database="firestore")
+        return None
+    except Exception as e:
+        print(f"Error interno Firestore: {e}")
+        return None
+
+# B. Inicialización Rápida
+db = get_firestore_connection()
+DOCUMENT_ID = "memoria_jarvis_v2"
+doc_ref = None
+
+# C. Configuración de Referencia
+if db:
+    try:
         doc_ref = db.collection("conversaciones").document(DOCUMENT_ID)
-    else:
-        st.warning("⚠️ No hay credenciales. Base de datos apagada.")
-        
-except Exception as e:
-    st.error(f"Advertencia Firestore: {e}")
+    except Exception as e:
+        st.error(f"Error conectando colección: {e}")
+else:
+    st.warning("⚠️ No hay credenciales. Base de datos apagada (Modo Offline).")
 
 def save_message(role, content):
     """Guarda el mensaje en Firestore si está conectado"""
@@ -976,4 +989,5 @@ if process_interaction:
             st.code(traceback.format_exc())
 
 if st.button("🧪 PROBAR CONEXIÓN CALENDARIO", key="boton_prueba_clon"):
+
     test_calendar_connection()
