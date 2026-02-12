@@ -1,0 +1,15 @@
+streamlit
+google-generativeai
+google-cloud-firestore
+pypdf
+Pillow
+gTTS
+streamlit-mic-recorder
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+firebase-admin
+google-cloud-aiplatform
+edge-tts
+watchdog
