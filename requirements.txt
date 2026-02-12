@@ -13,3 +13,5 @@ firebase-admin
 google-cloud-aiplatform
 edge-tts
 watchdog
+pydub
+st-audio-recorder
