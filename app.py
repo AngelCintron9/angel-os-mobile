@@ -23,6 +23,21 @@ from firebase_admin import credentials, firestore
 # ---------------------------------------------------------
 st.set_page_config(page_title="Angel OS - Jarvis", page_icon="🎙️", layout="wide")
 
+# --- DIAGNÓSTICO EN VIVO ---
+status = st.empty() # Creamos un espacio vacío para mensajes
+status.info("🚀 Iniciando Angel OS...")
+time.sleep(0.5)
+
+status.info("📂 Cargando librerías...")
+# Aquí van tus imports pesados si quedaron algunos...
+
+status.info("🔥 Conectando a la Base de Datos...")
+# Aquí va tu código de conexión a Firebase...
+# (Si se queda aquí, es culpa de las credenciales)
+
+# Si pasa todo, borramos el mensaje
+status.empty()
+
 # Inicializar Variables de Estado
 if "messages" not in st.session_state: st.session_state.messages = []
 if "last_audio_hash" not in st.session_state: st.session_state.last_audio_hash = None
@@ -993,4 +1008,5 @@ if process_interaction:
 if st.button("🧪 PROBAR CONEXIÓN CALENDARIO", key="boton_prueba_clon"):
 
     test_calendar_connection()
+
 
