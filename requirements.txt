@@ -7,3 +7,4 @@ gTTS
 pydub
 Pillow
 numpy
+pypdf
