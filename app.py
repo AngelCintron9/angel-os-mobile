@@ -481,27 +481,6 @@ json_content = \"\"\"
 
     modo_seleccionado = st.radio("Modo:", ["🛡️ JARVIS", "💼 SOCIO"])
     PROMPT_BASE = PROMPT_JARVIS if "JARVIS" in modo_seleccionado else PROMPT_SOCIO
-
-# te quedaste aqui
-    
-    # Le inyectamos la memoria tatuada
-    memoria_actual = st.session_state.core_memory_cache if st.session_state.core_memory_cache else "Sin recuerdos aún."
-    CONTEXTO_MEMORIA = f"\n\n=== MEMORIA CENTRAL (LO QUE SABES DE ANGEL) ==={st.session_state.core_memory_cache}\n======================================"
-    ACTIVE_SYSTEM_PROMPT = PROMPT_BASE + CONTEXTO_MEMORIA
-
-    st.divider()
-
-    # B. SELECTOR DE MODELO
-    try:
-        model_list = genai.list_models()
-        model_options = [m.name for m in model_list if 'generateContent' in m.supported_generation_methods]
-        if not model_options: raise Exception
-    except:
-        model_options = ["models/gemini-2.5-flash", "models/gemini-2.5-pro"]
-    
-    selected_model = st.selectbox("Modelo Neural:", model_options, index=0)
-
-    st.divider()
     
     # Subida de Archivos
     uploaded_file = st.file_uploader("Analizar Archivo", type=["pdf", "txt", "jpg", "png"])
@@ -521,130 +500,67 @@ json_content = \"\"\"
 # ---------------------------------------------------------
 # 7. LOGICA PRINCIPAL (CHAT + TABS)
 # ---------------------------------------------------------
-tab_chat, tab_proyectos = st.tabs(["💬 Chat", "📊 Proyectos"])
-
-with tab_chat:
-    chat_container = st.container()
-    
-    # Historial
-    with chat_container:
-        for m in st.session_state.messages:
-            with st.chat_message(m["role"]):
-                content = m["content"]
-                if isinstance(content, list): st.write(content[0]) # Texto simple de lista
-                else: st.markdown(content)
-
-    # Input
-    c1, c2 = st.columns([0.85, 0.15])
-    with c2: audio_input = mic_recorder(start_prompt="🎙️", stop_prompt="🛑", key='recorder', format="webm")
-    with c1: user_text = st.chat_input("Comando...")
-
-with tab_proyectos:
-    gestor_de_proyectos()
-
-# Procesamiento
-user_content = []
-process = False
-
-if user_text:
-    user_content.append(user_text)
-    process = True
-
-if audio_input:
-    audio_bytes = audio_input['bytes']
-    current_hash = hashlib.md5(audio_bytes).hexdigest()
+prompt = None
+if user_text: prompt = user_text
+if audio_input and audio_input['bytes']:
+    current_hash = hashlib.md5(audio_input['bytes']).hexdigest()
     if current_hash != st.session_state.last_audio_hash:
         st.session_state.last_audio_hash = current_hash
-        user_content.append({"mime_type": "audio/webm", "data": audio_bytes})
-        process = True
+        prompt = "🎤 [Audio recibido]"
 
-if process:
-    # Preparar contexto
-    model_payload = user_content.copy()
-    display_text = user_text if user_text else "🎤 [Audio]"
-    
-    # Inyecciones
+if prompt:
+    model_payload = [prompt]
     if st.session_state.doc_text: model_payload.insert(0, f"CONTEXTO PDF: {st.session_state.doc_text}")
     if st.session_state.image_data: model_payload.append(st.session_state.image_data)
-    
-    # UI Update
-    st.session_state.messages.append({"role": "user", "content": display_text})
-    with chat_container: st.chat_message("user").markdown(display_text)
-    save_message("user", display_text)
 
-    # Gemini Call
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with chat_container.chat_message("user"): st.markdown(prompt)
+
     try:
-        # Usamos credenciales si existen, si no, intentamos API KEY (fallback)
-        if creds:
-             # Vertex AI Init ya se hizo arriba
-             pass 
-        else:
-             # Fallback a API Key si no hay token (solo texto)
-             genai.configure(api_key=st.secrets.get("GOOGLE_API_KEY"))
-
-        model = genai.GenerativeModel(
-            model_name=selected_model,
-            system_instruction = ACTIVE_SYSTEM_PROMPT + f"\nMEMORIA: {st.session_state.core_memory_cache}",
-            tools=mis_herramientas
-        )
+        if not api_key: st.error("Falta API Key"); st.stop()
         
-        # Historial simple para API
+        FULL_PROMPT = PROMPT_BASE + f"\n\nMEMORIA VITAL:\n{st.session_state.core_memory_cache}"
+        
+        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=FULL_PROMPT, tools=mis_herramientas)
         history = [{"role": m["role"], "parts": [m["content"]]} for m in st.session_state.messages if isinstance(m["content"], str)]
         chat = model.start_chat(history=history)
-        
-        with st.spinner("⚡ Pensando..."):
+
+        with st.spinner("⚡ Procesando..."):
             response = chat.send_message(model_payload)
-            
             final_text = ""
-            
-            # Procesamiento de Tools
             if response.parts:
                 for part in response.parts:
                     if fn := part.function_call:
                         args = {k: v for k, v in fn.args.items()}
-                        # Ejecución dinámica
                         func = globals().get(fn.name)
                         if func:
                             with st.status(f"⚙️ {fn.name}...", expanded=True) as s:
                                 res = func(**args)
                                 s.write(res); s.update(state="complete")
-                                
-                                # Respuesta a la herramienta
                                 response_parts = [genai.protos.Part(function_response=genai.protos.FunctionResponse(name=fn.name, response={"result": res}))]
                                 final_res = chat.send_message(response_parts)
                                 final_text = final_res.text
-                        else: final_text = f"Error: Herramienta {fn.name} no encontrada."
-                    elif part.text:
+                    else:
                         final_text += part.text
 
-            # Mostrar Respuesta
-            with chat_container:
-                st.chat_message("assistant").markdown(final_text)
-                if st.session_state.generated_image_cache:
-                    st.image(st.session_state.generated_image_cache._pil_image, caption="Generado por Jarvis")
-                    if st.button("❌ Cerrar Foto"): st.session_state.generated_image_cache = None; st.rerun()
-
+            with chat_container.chat_message("assistant"): st.markdown(final_text)
             st.session_state.messages.append({"role": "assistant", "content": final_text})
-            save_message("assistant", final_text)
-
-            # Guardar en DB (asíncrono idealmente, pero aquí directo)
-            if db:
-                doc_ref = db.collection("conversaciones").document("historial_v1")
-                doc_ref.set({"msgs": firestore.ArrayUnion([{"role": "user", "txt": prompt}, {"role": "ai", "txt": final_text}])}, merge=True)
             
-            # Audio TTS
-            if final_text:
-                async def text_to_speech():
-                    communicate = edge_tts.Communicate(final_text, "es-MX-JorgeNeural")
-                    await communicate.save("response.mp3")
+            # Guardar historial (solo si hay DB)
+            if db:
                 try:
-                    loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
-                    loop.run_until_complete(text_to_speech())
-                    st.audio("response.mp3", format="audio/mp3", autoplay=True)
+                    doc_ref = db.collection("conversaciones").document("historial_v1")
+                    doc_ref.set({"msgs": firestore.ArrayUnion([{"role": "user", "txt": prompt}, {"role": "ai", "txt": final_text}])}, merge=True)
+                except: pass
+
+            if final_text:
+                try:
+                    async def speak():
+                        cm = edge_tts.Communicate(final_text, "es-MX-JorgeNeural")
+                        await cm.save("out.mp3")
+                    asyncio.run(speak())
+                    st.audio("out.mp3", autoplay=True)
                 except: pass
 
     except Exception as e:
         st.error(f"Error: {e}")
-
-
-
