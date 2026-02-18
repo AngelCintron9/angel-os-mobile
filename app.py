@@ -8,7 +8,6 @@ import time
 import json
 from PIL import Image
 import pypdf
-import io
 from streamlit_mic_recorder import mic_recorder
 import google.auth
 from google.oauth2.credentials import Credentials
@@ -33,8 +32,9 @@ if "generated_image_cache" not in st.session_state: st.session_state.generated_i
 if "core_memory_cache" not in st.session_state: st.session_state.core_memory_cache = None
 
 # ---------------------------------------------------------
-# 2. MOTOR DE AUTENTICACIÓN UNIFICADO (SUPER TOKEN)
+# 2. AUTENTICACIÓN HÍBRIDA (LA CLAVE DEL ÉXITO)
 # ---------------------------------------------------------
+PROJECT_ID = "jarvis-ia-v1"
 SCOPES = [
     'https://www.googleapis.com/auth/calendar',
     'https://www.googleapis.com/auth/cloud-platform'
@@ -48,10 +48,6 @@ def get_google_credentials():
     """
     if "token_json" in st.secrets:
         try:
-            # 1. Leemos el texto crudo del JSON desde el secreto
-            # Asegúrate de que en secrets.toml esté así:
-            # [token_json]
-            # json_content = """...contenido del archivo token.json..."""
             json_str = st.secrets["token_json"]["json_content"]
             token_info = json.loads(json_str)
             
@@ -78,65 +74,31 @@ def get_google_credentials():
         
     return None
 
-# --- INICIALIZACIÓN DE SERVICIOS GLOBALES ---
-creds = get_google_credentials()
-PROJECT_ID = "jarvis-ia-v1" # Tu ID de proyecto fijo
+# --- INICIALIZAR SERVICIOS ---
+creds_db = get_db_credentials() # Credenciales complejas para DB
+api_key = st.secrets.get("GOOGLE_API_KEY") # Clave simple para Chat
 
 # 1. Firestore (Base de Datos)
 db = None
-if creds:
+if creds_db:
     try:
-        db = firestore.Client(credentials=creds, project=PROJECT_ID)
-    except Exception as e:
-        st.error(f"Error Firestore: {e}")
+        db = firestore.Client(credentials=creds_db, project=PROJECT_ID)
+    except Exception as e: st.error(f"Error conectando DB: {e}")
 
-# 2. Vertex AI (Cerebro Visual)
-if creds:
+# 2. Vertex AI (Solo para generar imágenes)
+if creds_db:
     try:
-        vertexai.init(project=PROJECT_ID, location="us-central1", credentials=creds)
-    except Exception as e:
-        st.error(f"Error Vertex AI: {e}")
+        vertexai.init(project=PROJECT_ID, location="us-central1", credentials=creds_db)
+    except: pass
+
+# 3. Configurar Chat (Gemini) - Usamos API Key por velocidad
+if api_key:
+    genai.configure(api_key=api_key)
+else:
+    st.error("⚠️ Falta GOOGLE_API_KEY en Secrets")
 
 # ---------------------------------------------------------
-# 3. FUNCIONES DE MEMORIA Y GESTIÓN
-# ---------------------------------------------------------
-DOCUMENT_ID = "memoria_jarvis_v2"
-
-def save_message(role, content):
-    """Guarda el mensaje en Firestore"""
-    if db:
-        try:
-            doc_ref = db.collection("conversaciones").document(DOCUMENT_ID)
-            text_to_save = content if isinstance(content, str) else "[Contenido Multimodal]"
-            doc_ref.set({
-                "messages": firestore.ArrayUnion([{"role": role, "content": text_to_save, "timestamp": time.time()}])
-            }, merge=True)
-        except Exception as e:
-            print(f"Error guardando chat: {e}")
-
-# --- BÓVEDA DE MEMORIA CENTRAL ---
-if "core_memory_cache" not in st.session_state: st.session_state.core_memory_cache = None
-
-def load_core_memory():
-    """Lee la bóveda de Firestore"""
-    if not db: return ""
-    try:
-        memoria_texto = ""
-        docs = db.collection('memoria_central').stream()
-        for doc in docs:
-            datos = doc.to_dict()
-            recuerdos = datos.get("recuerdos", [])
-            if recuerdos:
-                memoria_texto += f"\n- [{doc.id}]: " + " | ".join(recuerdos)
-        return memoria_texto
-    except Exception as e:
-        return ""
-
-if st.session_state.core_memory_cache is None:
-    st.session_state.core_memory_cache = load_core_memory()
-
-# ---------------------------------------------------------
-# 4. HERRAMIENTAS (TOOLS)
+# 3. HERRAMIENTAS (TOOLS)
 # ---------------------------------------------------------
 zona_pr = timezone(timedelta(hours=-4))
 fecha_ui = datetime.now(zona_pr).strftime("%A, %d de %B de %Y - %I:%M %p")
@@ -186,27 +148,19 @@ def add_event_to_google(summary, start_time, duration_minutes=60):
         return f"❌ Error Calendar: {str(e)}"
 
 def add_task_to_board(tarea, estado="🚀 Por hacer", prioridad="🔵 Media", fecha=""):
-    """Añade tarea al tablero."""
-    if not db: return "❌ Error DB."
+    if not db: return "❌ Error: Base de datos desconectada."
     try:
-        db.collection('proyectos').add({
-            "Tarea": tarea, "Estado": estado, "Prioridad": prioridad, "Fecha": fecha
-        })
-        return f"✅ Tarea añadida: {tarea}"
-    except Exception as e: return f"Error: {e}"
+        db.collection('proyectos').add({"Tarea": tarea, "Estado": estado, "Prioridad": prioridad, "Fecha": fecha})
+        return f"✅ Tarea guardada: {tarea}"
+    except Exception as e: return f"Error DB: {e}"
 
 def read_board_tasks(filtro_estado=""):
-    """Lee tareas del tablero."""
-    if not db: return "❌ Error DB."
+    if not db: return "❌ DB Desconectada."
     try:
         docs = db.collection('proyectos').stream()
-        tareas = []
-        for doc in docs:
-            d = doc.to_dict()
-            if filtro_estado and filtro_estado not in d.get("Estado", ""): continue
-            tareas.append(f"- {d.get('Tarea')} ({d.get('Estado')})")
+        tareas = [f"- {d.to_dict().get('Tarea')}" for d in docs]
         return "\n".join(tareas) if tareas else "📭 Tablero vacío."
-    except Exception as e: return f"Error: {e}"
+    except: return "Error leyendo tareas."
 
 def generate_creative_image(prompt_visual):
     """Genera imágenes con Imagen 3 Fast."""
@@ -223,15 +177,25 @@ def generate_creative_image(prompt_visual):
         return "⚠️ No se generó imagen."
     except Exception as e:
         return f"❌ Error Imagen: {str(e)}"
+        
+def save_book_knowledge(titulo, aprendizajes_clave):
+    if not db: return "❌ Error DB."
+    try:
+        db.collection('biblioteca').document(titulo).set({
+            "resumen": aprendizajes_clave,
+            "fecha": datetime.now().strftime("%Y-%m-%d")
+        })
+        return f"📚 Libro '{titulo}' archivado."
+    except Exception as e: return f"Error: {e}"
 
 # Mapa de herramientas para Gemini
 mis_herramientas = [
     get_current_time, update_core_memory, add_event_to_google, 
-    add_task_to_board, read_board_tasks, generate_creative_image
+    add_task_to_board, read_board_tasks, generate_creative_image, save_book_knowledge
 ]
 
 # ---------------------------------------------------------
-# 5. GESTOR DE PROYECTOS (UI)
+# 4. GESTOR DE PROYECTOS (UI)
 # ---------------------------------------------------------
 def gestor_de_proyectos():
     st.header("📊 Tablero de Mando")
@@ -276,6 +240,44 @@ def gestor_de_proyectos():
                 st.success("✅ Tablero Actualizado"); time.sleep(1); st.rerun()
                 
     except Exception as e: st.error(f"Error cargando tablero: {e}")
+
+# ---------------------------------------------------------
+# 5. FUNCIONES DE MEMORIA Y GESTIÓN
+# ---------------------------------------------------------
+DOCUMENT_ID = "memoria_jarvis_v2"
+
+def save_message(role, content):
+    """Guarda el mensaje en Firestore"""
+    if db:
+        try:
+            doc_ref = db.collection("conversaciones").document(DOCUMENT_ID)
+            text_to_save = content if isinstance(content, str) else "[Contenido Multimodal]"
+            doc_ref.set({
+                "messages": firestore.ArrayUnion([{"role": role, "content": text_to_save, "timestamp": time.time()}])
+            }, merge=True)
+        except Exception as e:
+            print(f"Error guardando chat: {e}")
+
+# --- BÓVEDA DE MEMORIA CENTRAL ---
+if "core_memory_cache" not in st.session_state: st.session_state.core_memory_cache = None
+
+def load_core_memory():
+    """Lee la bóveda de Firestore"""
+    if not db: return ""
+    try:
+        memoria_texto = ""
+        docs = db.collection('memoria_central').stream()
+        for doc in docs:
+            datos = doc.to_dict()
+            recuerdos = datos.get("recuerdos", [])
+            if recuerdos:
+                memoria_texto += f"\n- [{doc.id}]: " + " | ".join(recuerdos)
+        return memoria_texto
+    except Exception as e:
+        return ""
+
+if st.session_state.core_memory_cache is None:
+    st.session_state.core_memory_cache = load_core_memory()
 
 # ---------------------------------------------------------
 # 6. INTERFAZ Y PROMPTS
@@ -617,6 +619,11 @@ if process:
             st.session_state.messages.append({"role": "assistant", "content": final_text})
             save_message("assistant", final_text)
 
+            # Guardar en DB (asíncrono idealmente, pero aquí directo)
+            if db:
+                doc_ref = db.collection("conversaciones").document("historial_v1")
+                doc_ref.set({"msgs": firestore.ArrayUnion([{"role": "user", "txt": prompt}, {"role": "ai", "txt": final_text}])}, merge=True)
+            
             # Audio TTS
             if final_text:
                 async def text_to_speech():
