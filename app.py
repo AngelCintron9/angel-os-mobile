@@ -80,12 +80,6 @@ def get_db_credentials():
     except Exception as e:
         st.error(f"❌ Error procesando el Token Maestro: {e}")
         return None
-    
-    # Fallback para desarrollo local (si tienes el archivo token.json en la carpeta)
-    elif os.path.exists("token.json"):
-        return Credentials.from_authorized_user_info(info=json.load(open("token.json")), scopes=SCOPES)
-        
-    return None
 
 # --- INICIALIZAR SERVICIOS ---
 creds_db = get_db_credentials() # Credenciales complejas para DB
@@ -650,4 +644,5 @@ if process:
 
     except Exception as e:
         st.error(f"Error: {e}")
+
 
