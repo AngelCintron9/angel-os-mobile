@@ -1,215 +1,124 @@
 import streamlit as st
 import google.generativeai as genai
 from google.cloud import firestore
+import vertexai
+from vertexai.preview.vision_models import ImageGenerationModel
 import os
 import time
 import json
 from PIL import Image
 import pypdf
-from gtts import gTTS
 import io
 from streamlit_mic_recorder import mic_recorder
-from google.oauth2 import service_account
+import google.auth
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 import hashlib
 import asyncio
 import edge_tts
-import firebase_admin
-from firebase_admin import credentials, firestore
-
+from datetime import datetime, timezone, timedelta
+import pandas as pd
 
 # ---------------------------------------------------------
 # 1. CONFIGURACIÓN INICIAL
 # ---------------------------------------------------------
 st.set_page_config(page_title="Angel OS - Jarvis", page_icon="🎙️", layout="wide")
 
-# --- DIAGNÓSTICO EN VIVO ---
-status = st.empty() # Creamos un espacio vacío para mensajes
-status.info("🚀 Iniciando Angel OS...")
-time.sleep(0.5)
-
-status.info("📂 Cargando librerías...")
-# Aquí van tus imports pesados si quedaron algunos...
-
-status.info("🔥 Conectando a la Base de Datos...")
-# Aquí va tu código de conexión a Firebase...
-# (Si se queda aquí, es culpa de las credenciales)
-
-# Si pasa todo, borramos el mensaje
-status.empty()
-
 # Inicializar Variables de Estado
 if "messages" not in st.session_state: st.session_state.messages = []
 if "last_audio_hash" not in st.session_state: st.session_state.last_audio_hash = None
 if "doc_text" not in st.session_state: st.session_state.doc_text = ""
 if "image_data" not in st.session_state: st.session_state.image_data = None
-if "generated_image_cache" not in st.session_state:
-    st.session_state.generated_image_cache = None # Aquí guardaremos la obra de arte
+if "generated_image_cache" not in st.session_state: st.session_state.generated_image_cache = None
+if "core_memory_cache" not in st.session_state: st.session_state.core_memory_cache = None
 
 # ---------------------------------------------------------
-# 2. FUNCIONES DE CONEXIÓN (MODO DETECTIVE + SECRETS)
+# 2. MOTOR DE AUTENTICACIÓN UNIFICADO (SUPER TOKEN)
 # ---------------------------------------------------------
-import google.auth
-from googleapiclient.discovery import build
-import os
+SCOPES = [
+    'https://www.googleapis.com/auth/calendar',
+    'https://www.googleapis.com/auth/cloud-platform'
+]
 
-# Scopes: Permisos necesarios para leer/escribir en Calendar
-SCOPES = ['https://www.googleapis.com/auth/calendar']
-
-def get_secret(key_name):
-    """Obtiene secretos de Streamlit o Variables de Entorno"""
-    if key_name in st.secrets: return st.secrets[key_name]
-    return os.environ.get(key_name)
-
-def get_google_credentials():
-    """Conexión Nativa para Google Cloud (ADC) con depuración visual"""
-    # st.write("🕵️‍♂️ Iniciando autenticación...") # Descomentar para ver logs en pantalla
-    try:
-        # La magia de Google: Busca automáticamente tus credenciales de la terminal
-        creds, project = google.auth.default(scopes=SCOPES)
-        return creds
-    except Exception as e:
-        st.error(f"⚠️ Error de Autenticación Cloud: {e}")
-        return None
-
-def test_calendar_connection():
-    """Prueba simple para ver si podemos hablar con Google"""
-    creds = get_google_credentials()
-    if not creds: 
-        st.error("❌ No se encontraron credenciales.")
-        return
-    
-    try:
-        service = build('calendar', 'v3', credentials=creds)
-        # Intentamos listar los calendarios (operación de lectura)
-        events = service.calendarList().list().execute()
-        st.success("🎉 ¡CONEXIÓN EXITOSA AL CALENDARIO! Jarvis tiene permiso real.")
-        st.write(f"📅 Calendarios encontrados: {len(events.get('items', []))}")
-    except Exception as e:
-        st.error(f"❌ Error conectando al API de Calendario:\n{e}")
-        st.warning("💡 PISTA: Si el error es 403, falta habilitar la API o dar permisos en 'gcloud auth'.")
-        
-# ---------------------------------------------------------
-# 3. FUNCIONES DE GESTIÓN DE PROYECTOS (TABLAS)
-# ---------------------------------------------------------
-import pandas as pd
-import time # Añadimos time para una pausa visual al guardar
-
-def gestor_de_proyectos():
-    st.header("📊 Tablero de Mando")
-
-    try:
-        docs = db.collection('proyectos').stream()
-        items = [{'id': doc.id, **doc.to_dict()} for doc in docs]
-    except Exception as e:
-        st.error(f"Error conectando a la base de datos: {e}")
-        items = []
-
-    # 2. Crear DataFrame (Tabla)
-    if items:
-        df = pd.DataFrame(items)
-        cols = ['Tarea', 'Estado', 'Prioridad', 'Fecha', 'id']
-        for col in cols:
-            if col not in df.columns: df[col] = None # Usamos None en vez de ""
-        
-        df = df[cols]
-        # 💡 LA MAGIA: Convertimos el texto a Fecha Real para Streamlit
-        df['Fecha'] = pd.to_datetime(df['Fecha'], errors='coerce')
-    else:
-        df = pd.DataFrame(columns=['Tarea', 'Estado', 'Prioridad', 'Fecha', 'id'])
-        # A la tabla vacía también le decimos que la columna será fecha
-        df['Fecha'] = pd.to_datetime(df['Fecha'], errors='coerce') 
-
-    # 3. EL EDITOR MÁGICO
-    edited_df = st.data_editor(
-        df,
-        num_rows="dynamic",
-        column_config={
-            "Estado": st.column_config.SelectboxColumn("Estado", options=["🚀 Por hacer", "⚙️ En Progreso", "✅ Completado"], required=True),
-            "Prioridad": st.column_config.SelectboxColumn("Prioridad", options=["🔥 Alta", "🔵 Media", "🟢 Baja"], required=True),
-            "Fecha": st.column_config.DateColumn("Fecha Límite"),
-            "id": st.column_config.Column(disabled=True),
-        },
-        hide_index=True,
-        key="editor_proyectos"
-    )
-
-    # 4. Botón de Guardado
-    if st.button("💾 Guardar Cambios en la Nube"):
-        with st.spinner("Sincronizando con Firestore..."):
-            try:
-                # 💡 TRADUCCIÓN INVERSA: Antes de guardar, volvemos a pasar la fecha a texto o vacío
-                edited_df['Fecha'] = edited_df['Fecha'].apply(lambda x: x.strftime('%Y-%m-%d') if pd.notnull(x) else None)
-                
-                collection_ref = db.collection('proyectos')
-                records = edited_df.to_dict(orient='records')
-                
-                for record in records:
-                    doc_id = record.pop('id', None)
-                    
-                    if doc_id and len(str(doc_id)) > 5:
-                        # Si tiene ID, actualiza
-                        collection_ref.document(doc_id).set(record)
-                    else:
-                        # Si NO tiene ID, crea uno nuevo (solo si la tarea no está en blanco)
-                        if str(record.get('Tarea', '')).strip() != "":
-                            collection_ref.add(record)
-                
-                st.success("✅ ¡Tablero actualizado!")
-                time.sleep(1) # Pausa para que veas el mensaje verde
-                st.rerun() # Recargamos para limpiar
-            except Exception as e:
-                st.error(f"Error al guardar: {e}")
-                
-# ---------------------------------------------------------
-# 4. BASE DE DATOS (FIRESTORE) - OPTIMIZADO
-# ---------------------------------------------------------
-
-# A. Función de Conexión con CACHÉ (El secreto para que no falle el arranque)
 @st.cache_resource
-def get_firestore_connection():
-    try:
-        creds = get_google_credentials() # Tu función actual
-        if creds:
-            # Conectamos una sola vez y guardamos la conexión en memoria
-            return firestore.Client(credentials=creds, project="jarvis-ia-v1", database="firestore")
-        return None
-    except Exception as e:
-        print(f"Error interno Firestore: {e}")
-        return None
+def get_google_credentials():
+    """
+    Recupera la 'Llave Maestra' desde los Secretos de Streamlit.
+    Esta credencial sirve para: Calendar, Firestore y Vertex AI.
+    """
+    if "token_json" in st.secrets:
+        try:
+            # 1. Leemos el texto crudo del JSON desde el secreto
+            # Asegúrate de que en secrets.toml esté así:
+            # [token_json]
+            # json_content = """...contenido del archivo token.json..."""
+            json_str = st.secrets["token_json"]["json_content"]
+            token_info = json.loads(json_str)
+            
+            # 2. Reconstruimos la credencial
+            creds = Credentials.from_authorized_user_info(info=token_info, scopes=SCOPES)
+            
+            # 3. Auto-Refresco (Vital para que Jarvis no muera en 1 hora)
+            if creds and creds.expired and creds.refresh_token:
+                from google.auth.transport.requests import Request
+                try:
+                    creds.refresh(Request())
+                    # print("🔄 Token refrescado automáticamente")
+                except Exception as e:
+                    st.error(f"⚠️ Error refrescando token: {e}")
+            
+            return creds
+        except Exception as e:
+            st.error(f"❌ Error procesando el Token Maestro: {e}")
+            return None
+    
+    # Fallback para desarrollo local (si tienes el archivo token.json en la carpeta)
+    elif os.path.exists("token.json"):
+        return Credentials.from_authorized_user_info(info=json.load(open("token.json")), scopes=SCOPES)
+        
+    return None
 
-# B. Inicialización Rápida
-db = get_firestore_connection()
+# --- INICIALIZACIÓN DE SERVICIOS GLOBALES ---
+creds = get_google_credentials()
+PROJECT_ID = "jarvis-ia-v1" # Tu ID de proyecto fijo
+
+# 1. Firestore (Base de Datos)
+db = None
+if creds:
+    try:
+        db = firestore.Client(credentials=creds, project=PROJECT_ID)
+    except Exception as e:
+        st.error(f"Error Firestore: {e}")
+
+# 2. Vertex AI (Cerebro Visual)
+if creds:
+    try:
+        vertexai.init(project=PROJECT_ID, location="us-central1", credentials=creds)
+    except Exception as e:
+        st.error(f"Error Vertex AI: {e}")
+
+# ---------------------------------------------------------
+# 3. FUNCIONES DE MEMORIA Y GESTIÓN
+# ---------------------------------------------------------
 DOCUMENT_ID = "memoria_jarvis_v2"
-doc_ref = None
-
-# C. Configuración de Referencia
-if db:
-    try:
-        doc_ref = db.collection("conversaciones").document(DOCUMENT_ID)
-    except Exception as e:
-        st.error(f"Error conectando colección: {e}")
-else:
-    st.warning("⚠️ No hay credenciales. Base de datos apagada (Modo Offline).")
 
 def save_message(role, content):
-    """Guarda el mensaje en Firestore si está conectado"""
-    if doc_ref:
+    """Guarda el mensaje en Firestore"""
+    if db:
         try:
-            # Si es imagen o algo complejo, guardamos un placeholder
+            doc_ref = db.collection("conversaciones").document(DOCUMENT_ID)
             text_to_save = content if isinstance(content, str) else "[Contenido Multimodal]"
             doc_ref.set({
                 "messages": firestore.ArrayUnion([{"role": role, "content": text_to_save, "timestamp": time.time()}])
             }, merge=True)
         except Exception as e:
-            print(f"No se pudo guardar en nube: {e}")
+            print(f"Error guardando chat: {e}")
 
 # --- BÓVEDA DE MEMORIA CENTRAL ---
-if "core_memory_cache" not in st.session_state: 
-    st.session_state.core_memory_cache = None # Empezamos vacío
+if "core_memory_cache" not in st.session_state: st.session_state.core_memory_cache = None
 
 def load_core_memory():
-    """Lee la bóveda de Firestore una sola vez y la formatea como texto"""
+    """Lee la bóveda de Firestore"""
     if not db: return ""
     try:
         memoria_texto = ""
@@ -221,255 +130,158 @@ def load_core_memory():
                 memoria_texto += f"\n- [{doc.id}]: " + " | ".join(recuerdos)
         return memoria_texto
     except Exception as e:
-        print(f"Error cargando memoria central: {e}")
         return ""
 
-# Cargamos a la RAM solo si no se ha cargado antes
 if st.session_state.core_memory_cache is None:
     st.session_state.core_memory_cache = load_core_memory()
 
 # ---------------------------------------------------------
-# 5. HERRAMIENTAS (CALENDARIO)
+# 4. HERRAMIENTAS (TOOLS)
 # ---------------------------------------------------------
-CALENDAR_ID = "angelyavielcintron77@gmail.com"
-
-# ---------------------------------------------------------
-# 5. HERRAMIENTAS (TOOLS)
-# ---------------------------------------------------------
-from datetime import datetime, timezone, timedelta
-
-# --- RELOJ GLOBAL PARA LA INTERFAZ --- (Sin espacios a la izquierda)
 zona_pr = timezone(timedelta(hours=-4))
 fecha_ui = datetime.now(zona_pr).strftime("%A, %d de %B de %Y - %I:%M %p")
 
-# --- HERRAMIENTA COGNITIVA PARA JARVIS ---
 def get_current_time():
-    """
-    Reloj Interno del Sistema.
-    Devuelve la fecha y hora exacta actual en Puerto Rico. 
-    """
-    zona_pr_jarvis = timezone(timedelta(hours=-4))
-    fecha_exacta = datetime.now(zona_pr_jarvis).strftime("%A, %d de %B de %Y - %I:%M:%S %p")
-    return f"La fecha y hora actual en el sistema es: {fecha_exacta}"
+    """Devuelve la fecha y hora exacta actual en Puerto Rico."""
+    fecha_exacta = datetime.now(zona_pr).strftime("%A, %d de %B de %Y - %I:%M:%S %p")
+    return f"La fecha y hora actual es: {fecha_exacta}"
 
 def update_core_memory(hecho, categoria="General"):
-    """
-    Bóveda de Memoria a Largo Plazo.
-    Úsala proactivamente para guardar datos vitales, preferencias o metas de Angel.
-    Args:
-        hecho: El dato exacto a recordar.
-        categoria: Clasificación (ej. "Negocios", "Personal", "Preferencias").
-    """
-    if not db: return "❌ Error: Base de datos no conectada."
-    
+    """Guarda datos vitales en la memoria a largo plazo."""
+    if not db: return "❌ Error: DB desconectada."
     try:
-        doc_ref = db.collection('memoria_central').document(categoria)
-        doc_ref.set({
+        db.collection('memoria_central').document(categoria).set({
             "recuerdos": firestore.ArrayUnion([hecho]),
             "ultima_actualizacion": time.time()
         }, merge=True)
         
-        # Actualizamos la caché en tiempo real para que Jarvis lo sepa ya mismo
-        if st.session_state.core_memory_cache is None:
-            st.session_state.core_memory_cache = ""
+        # Actualizar caché local
+        if st.session_state.core_memory_cache is None: st.session_state.core_memory_cache = ""
         st.session_state.core_memory_cache += f"\n- [{categoria}]: {hecho}"
-        
-        return f"🧠 Recuerdo tatuado en la bóveda [{categoria}]: '{hecho}'"
+        return f"🧠 Recuerdo guardado en [{categoria}]: '{hecho}'"
     except Exception as e:
-        return f"❌ Error al guardar en bóveda: {str(e)}"
+        return f"❌ Error memoria: {str(e)}"
 
 def add_event_to_google(summary, start_time, duration_minutes=60):
-    """
-    Agendador Real.
-    Crea eventos en Google Calendar usando las credenciales nativas del sistema.
-    Args:
-        summary: Título del evento.
-        start_time: Fecha y hora en formato ISO (ej: '2026-02-10T17:00:00').
-        duration_minutes: Duración en minutos (default 60).
-    """
-    # 1. Obtenemos las credenciales (Usando la función nueva que SÍ funciona)
-    creds = get_google_credentials()
-    
-    if not creds:
-        return "❌ Error: No tengo credenciales válidas para acceder al calendario."
-
+    """Crea eventos en Google Calendar."""
+    if not creds: return "❌ Error: Sin credenciales."
     try:
-        # 2. Conectamos con Google
         service = build('calendar', 'v3', credentials=creds)
         
-        # 3. Calculamos horas (Parseo robusto)
+        # Parseo de fecha flexible
         try:
-            # Intentamos leer el formato que manda Gemini
-            if "T" in start_time:
-                start_dt = datetime.fromisoformat(start_time)
-            else:
-                # A veces manda solo fecha, asumimos 9am
-                start_dt = datetime.fromisoformat(f"{start_time}T09:00:00")
-        except:
-            return f"❌ Formato de fecha no entendido: {start_time}"
+            if "T" in start_time: start_dt = datetime.fromisoformat(start_time)
+            else: start_dt = datetime.fromisoformat(f"{start_time}T09:00:00")
+        except: return f"❌ Formato de fecha inválido: {start_time}"
 
         end_dt = start_dt + timedelta(minutes=duration_minutes)
-
-        # 4. Creamos el objeto del evento
         event = {
             'summary': summary,
-            'start': {
-                'dateTime': start_dt.isoformat(),
-                'timeZone': 'America/Puerto_Rico',
-            },
-            'end': {
-                'dateTime': end_dt.isoformat(),
-                'timeZone': 'America/Puerto_Rico',
-            },
+            'start': {'dateTime': start_dt.isoformat(), 'timeZone': 'America/Puerto_Rico'},
+            'end': {'dateTime': end_dt.isoformat(), 'timeZone': 'America/Puerto_Rico'},
         }
-
-        # 5. ¡ENVIAMOS A LA NUBE!
-        event_result = service.events().insert(calendarId='primary', body=event).execute()
-        
-        return f"✅ Evento creado con éxito: {summary} ({start_dt.strftime('%H:%M')}). Link: {event_result.get('htmlLink')}"
-
+        res = service.events().insert(calendarId='primary', body=event).execute()
+        return f"✅ Evento '{summary}' creado. Link: {res.get('htmlLink')}"
     except Exception as e:
-        return f"❌ Error de Google Calendar: {str(e)}"
+        return f"❌ Error Calendar: {str(e)}"
 
-def add_task_to_board(tarea, estado="🚀 Por hacer", prioridad="🔵 Media", fecha="", **kwargs):
-    """
-    Gestor de Tareas.
-    Añade una nueva misión o tarea al Tablero de Mando (Base de datos).
-    Args:
-        tarea: Descripción corta de la tarea.
-        estado: Puede ser "🚀 Por hacer", "⚙️ En Progreso", o "✅ Completado".
-        prioridad: Puede ser "🔥 Alta", "🔵 Media", o "🟢 Baja".
-        fecha: Fecha límite opcional en formato YYYY-MM-DD.
-    """
-    if not db:
-        return "❌ Error: La base de datos no está conectada."
-    
+def add_task_to_board(tarea, estado="🚀 Por hacer", prioridad="🔵 Media", fecha=""):
+    """Añade tarea al tablero."""
+    if not db: return "❌ Error DB."
     try:
-        nueva_tarea = {
-            "Tarea": tarea,
-            "Estado": estado,
-            "Prioridad": prioridad,
-            "Fecha": fecha
-        }
-        # Guardar en la colección 'proyectos' de Firestore
-        db.collection('proyectos').add(nueva_tarea)
-        return f"✅ Misión añadida al tablero: '{tarea}' (Prioridad: {prioridad})"
-    except Exception as e:
-        return f"❌ Error guardando la tarea: {str(e)}"
+        db.collection('proyectos').add({
+            "Tarea": tarea, "Estado": estado, "Prioridad": prioridad, "Fecha": fecha
+        })
+        return f"✅ Tarea añadida: {tarea}"
+    except Exception as e: return f"Error: {e}"
 
 def read_board_tasks(filtro_estado=""):
-    """
-    Ojo Analítico del Tablero.
-    Lee las tareas actuales en el Tablero de Mando (Firestore).
-    Args:
-        filtro_estado: (Opcional) Filtrar por "🚀 Por hacer", "⚙️ En Progreso", o "✅ Completado". 
-                       Si se deja vacío, lee todas las tareas.
-    """
-    if not db:
-        return "❌ Error: Base de datos no conectada."
-    
+    """Lee tareas del tablero."""
+    if not db: return "❌ Error DB."
     try:
         docs = db.collection('proyectos').stream()
         tareas = []
-        
         for doc in docs:
-            data = doc.to_dict()
-            estado_actual = data.get("Estado", "")
-            
-            # Si Jarvis usa un filtro, ignoramos las tareas que no coincidan
-            if filtro_estado and filtro_estado not in estado_actual:
-                continue
-                
-            tarea_str = f"- Tarea: '{data.get('Tarea', 'Sin título')}' | Prioridad: {data.get('Prioridad', 'N/A')} | Estado: {estado_actual} | Fecha Límite: {data.get('Fecha', 'Sin fecha')}"
-            tareas.append(tarea_str)
-        
-        if not tareas:
-            return f"El tablero está vacío o no hay tareas bajo el filtro: '{filtro_estado}'."
-            
-        return "📋 TAREAS ENCONTRADAS EN EL TABLERO:\n" + "\n".join(tareas)
-    except Exception as e:
-        return f"❌ Error leyendo el tablero: {str(e)}"
-
-def save_book_knowledge(titulo, aprendizajes_clave):
-    """
-    Guarda el resumen de un libro en la Biblioteca Permanente de Firestore.
-    Args:
-        titulo: Título del libro.
-        aprendizajes_clave: Resumen de los puntos más importantes (texto).
-    """
-    if not db: return "❌ Error DB"
-    
-    try:
-        # Crea un documento nuevo en la colección 'biblioteca'
-        db.collection('biblioteca').document(titulo).set({
-            "resumen": aprendizajes_clave,
-            "fecha_lectura": datetime.now().strftime("%Y-%m-%d")
-        })
-        return f"📚 Libro '{titulo}' guardado en la Biblioteca Permanente."
-    except Exception as e:
-        return f"❌ Error guardando libro: {str(e)}"
+            d = doc.to_dict()
+            if filtro_estado and filtro_estado not in d.get("Estado", ""): continue
+            tareas.append(f"- {d.get('Tarea')} ({d.get('Estado')})")
+        return "\n".join(tareas) if tareas else "📭 Tablero vacío."
+    except Exception as e: return f"Error: {e}"
 
 def generate_creative_image(prompt_visual):
-    """
-    Motor de Arte Digital (Nano Banana / Imagen 3 FAST).
-    OPTIMIZADO: Carga las librerías SOLO cuando se necesitan (Lazy Import).
-    """
-    
-    # 1. IMPORTACIÓN TÁCTICA (Aquí es donde ganamos velocidad de inicio)
-    # Al ponerlo aquí dentro, la App no se traba al arrancar.
-    import vertexai
-    from vertexai.preview.vision_models import ImageGenerationModel
-
-    print(f"🎨 Iniciando generación con Imagen 3 Fast: {prompt_visual[:50]}...")
-    
+    """Genera imágenes con Imagen 3 Fast."""
+    if not creds: return "❌ Error: Sin credenciales Vertex."
+    print(f"🎨 Generando: {prompt_visual[:30]}...")
     try:
-        # 2. Configuración de Región
-        vertexai.init(location="us-central1")
-        
-        # 3. Cargamos el modelo
         model = ImageGenerationModel.from_pretrained("imagen-3.0-fast-generate-001")
-        
-        with st.spinner("⚡ Revelando fotografía a alta velocidad..."):
-            images = model.generate_images(
-                prompt=prompt_visual,
-                number_of_images=1,
-                language="es",
-                aspect_ratio="16:9",
-                safety_filter_level="block_some", 
-                person_generation="allow_adult"
-            )
-            
-            if images:
-                st.session_state.generated_image_cache = images[0]
-                return "✅ Imagen revelada exitosamente."
-            else:
-                return "⚠️ El motor no devolvió datos."
-
-    except Exception as e:
-        return f"❌ Error Técnico: {str(e)}"
-        
-        # PLAN B: Si falla, devolvemos el Prompt
-        return (
-            f"❌ **Error Técnico:** {error_msg}\n\n"
-            f"🛡️ **PLAN DE CONTINGENCIA:** Prompt manual:\n"
-            f"```text\n{prompt_visual}\n```"
+        images = model.generate_images(
+            prompt=prompt_visual, number_of_images=1, language="es", aspect_ratio="16:9"
         )
+        if images:
+            st.session_state.generated_image_cache = images[0]
+            return "✅ Imagen generada."
+        return "⚠️ No se generó imagen."
+    except Exception as e:
+        return f"❌ Error Imagen: {str(e)}"
 
-# 1. El Directorio de Herramientas (Añade esto debajo de tus funciones)
-mapa_herramientas = {
-    "add_event_to_google": add_event_to_google,
-    "add_task_to_board": add_task_to_board,
-    "get_current_time": get_current_time,
-    "update_core_memory": update_core_memory,
-    "read_board_tasks": read_board_tasks,
-    "save_book_knowledge": save_book_knowledge,
-    "generate_creative_image": generate_creative_image
-}
-
-mis_herramientas = list(mapa_herramientas.values())
+# Mapa de herramientas para Gemini
+mis_herramientas = [
+    get_current_time, update_core_memory, add_event_to_google, 
+    add_task_to_board, read_board_tasks, generate_creative_image
+]
 
 # ---------------------------------------------------------
-# 6. PERSONALIDADES (PROMPTS)
+# 5. GESTOR DE PROYECTOS (UI)
+# ---------------------------------------------------------
+def gestor_de_proyectos():
+    st.header("📊 Tablero de Mando")
+    if not db: st.error("Sin conexión a DB"); return
+    
+    try:
+        docs = db.collection('proyectos').stream()
+        items = [{'id': doc.id, **doc.to_dict()} for doc in docs]
+        df = pd.DataFrame(items) if items else pd.DataFrame(columns=['Tarea', 'Estado', 'Prioridad', 'Fecha', 'id'])
+        
+        # Limpieza de columnas
+        for col in ['Tarea', 'Estado', 'Prioridad', 'Fecha', 'id']:
+            if col not in df.columns: df[col] = None
+        
+        df['Fecha'] = pd.to_datetime(df['Fecha'], errors='coerce')
+        
+        edited_df = st.data_editor(
+            df[['Tarea', 'Estado', 'Prioridad', 'Fecha', 'id']],
+            num_rows="dynamic",
+            column_config={
+                "Estado": st.column_config.SelectboxColumn("Estado", options=["🚀 Por hacer", "⚙️ En Progreso", "✅ Completado"]),
+                "Prioridad": st.column_config.SelectboxColumn("Prioridad", options=["🔥 Alta", "🔵 Media", "🟢 Baja"]),
+                "Fecha": st.column_config.DateColumn("Fecha Límite"),
+                "id": st.column_config.Column(disabled=True),
+            },
+            hide_index=True,
+            key="editor_proyectos"
+        )
+        
+        if st.button("💾 Guardar Cambios"):
+            with st.spinner("Sincronizando..."):
+                edited_df['Fecha'] = edited_df['Fecha'].apply(lambda x: x.strftime('%Y-%m-%d') if pd.notnull(x) else None)
+                records = edited_df.to_dict(orient='records')
+                col_ref = db.collection('proyectos')
+                
+                # Lógica simple de guardado (Upsert)
+                for record in records:
+                    doc_id = record.pop('id', None)
+                    if doc_id and len(str(doc_id)) > 5: col_ref.document(doc_id).set(record)
+                    elif str(record.get('Tarea', '')).strip(): col_ref.add(record)
+                
+                st.success("✅ Tablero Actualizado"); time.sleep(1); st.rerun()
+                
+    except Exception as e: st.error(f"Error cargando tablero: {e}")
+
+# ---------------------------------------------------------
+# 6. INTERFAZ Y PROMPTS
+# ---------------------------------------------------------
+# ---------------------------------------------------------
+# PERSONALIDADES (PROMPTS)
 # ---------------------------------------------------------
 # ==========================================
 # 🧠 CEREBRO 1: JARVIS (VIDA & ADMIN)
@@ -633,42 +445,26 @@ Si el usuario sube un libro o documento de más de 10 páginas:
 4. Solo después de que Angel elija, procede a extraer tareas o lecciones.
 """
 
-# ---------------------------------------------------------
-# 7. INTERFAZ: SIDEBAR (CONFIGURACIÓN)
-# ---------------------------------------------------------
 with st.sidebar:
     st.header("🎛️ Centro de Control")
-    st.sidebar.info(f"🕒 Reloj del Sistema: {fecha_ui}")
-
-    # --- SISTEMA DE AUTENTICACIÓN TÁCTICA ---
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-
-    secret_pass = get_secret("JARVIS_PASSWORD")
+    st.sidebar.info(f"🕒 {fecha_ui}")
     
-    if secret_pass:
-        # Si NO estamos autenticados, mostramos la caja de texto
-        if not st.session_state.authenticated:
-            pwd = st.text_input("Identificación Requerida:", type="password")
-            
-            if pwd == secret_pass:
-                st.session_state.authenticated = True
-                st.rerun() # Recargamos para desaparecer la caja
-            elif pwd != "":
-                st.error("❌ Credenciales incorrectas")
-                
-            # Bloqueamos el resto de la app si no hay acceso
-            if not st.session_state.authenticated:
-                st.warning("🔒 Terminal Bloqueada"); st.stop()
-        
-        # Si SÍ estamos autenticados, mostramos el botón de bloqueo rápido
-        else:
-            st.success("🔓 Acceso Concedido: Bienvenido Arquitecto")
-            if st.button("🔒 Bloquear Terminal", type="primary"):
-                st.session_state.authenticated = False
-                st.rerun() # Recargamos para volver a pedir la clave
+    # Auth simple por contraseña
+    if "authenticated" not in st.session_state: st.session_state.authenticated = False
+    
+    # Recuperamos password de secrets o environment
+    secret_pass = st.secrets.get("JARVIS_PASSWORD", os.environ.get("JARVIS_PASSWORD"))
+    
+    if secret_pass and not st.session_state.authenticated:
+        pwd = st.text_input("Acceso:", type="password")
+        if pwd == secret_pass: st.session_state.authenticated = True; st.rerun()
+        elif pwd: st.error("❌ Acceso Denegado")
+        st.stop()
+    
+    st.success("🔓 Sistema Activo")
+    if st.button("🔒 Bloquear"): st.session_state.authenticated = False; st.rerun()
 
-# A. SELECTOR DE CEREBRO
+    # A. SELECTOR DE CEREBRO
     modo_seleccionado = st.radio(
         "Modo Activo:",
         ["🛡️ JARVIS", "💼 SOCIO"],
@@ -696,317 +492,141 @@ with st.sidebar:
     selected_model = st.selectbox("Modelo Neural:", model_options, index=0)
 
     st.divider()
-
-    # C. SUBIDA MULTIMODAL (ARCHIVOS)
-    uploaded_file = st.file_uploader("Analizar Archivo", type=["pdf", "txt", "jpg", "png"])
     
-    if st.session_state.doc_text:
-        st.info("📂 Libro en Memoria (Modo Silencioso)")
-        if st.button("❌ Olvidar Libro", key="btn_olvidar"):
-            st.session_state.doc_text = ""
-            st.session_state.image_data = None
-            st.rerun()
-
+    # Subida de Archivos
+    uploaded_file = st.file_uploader("Analizar Archivo", type=["pdf", "txt", "jpg", "png"])
     if uploaded_file:
-        file_type = uploaded_file.type
-        if "pdf" in file_type:
+        if "pdf" in uploaded_file.type:
             try:
                 reader = pypdf.PdfReader(uploaded_file)
-                text = ""
-                for page in reader.pages: text += page.extract_text()
-                st.session_state.doc_text = text
-                st.success("📄 PDF Leído")
-            except: st.error("Error leyendo PDF")
-        elif "image" in file_type:
+                st.session_state.doc_text = "".join([p.extract_text() for p in reader.pages])
+                st.toast("📄 PDF Cargado")
+            except: pass
+        elif "image" in uploaded_file.type:
             st.session_state.image_data = Image.open(uploaded_file)
-            st.image(st.session_state.image_data, caption="Vista Previa", use_container_width=True)
+            st.image(st.session_state.image_data, caption="Análisis Visual")
 
-    if st.button("🗑️ Reiniciar Cerebro"):
-        st.session_state.messages = []
-        st.session_state.doc_text = ""
-        st.session_state.image_data = None
-        st.session_state.last_audio_id = None
-        st.rerun()
+    if st.button("🗑️ Limpiar Chat"): st.session_state.messages = []; st.rerun()
 
-# ==========================================
-# 8. INTERFAZ PRINCIPAL CON PESTAÑAS
-# ==========================================
+# ---------------------------------------------------------
+# 7. LOGICA PRINCIPAL (CHAT + TABS)
+# ---------------------------------------------------------
+tab_chat, tab_proyectos = st.tabs(["💬 Chat", "📊 Proyectos"])
 
-# Crear las pestañas
-tab_chat, tab_proyectos = st.tabs(["💬 Chat con Jarvis", "📊 Gestión de Proyectos"])
-
-# --- PESTAÑA 1: CHAT (Toda tu lógica actual va aquí) ---
 with tab_chat:
-    st.subheader("Cerebro Digital")
-
-    # ---------------------------------------------------------
-    # CHAT VISUAL (Pegado aquí adentro)
-    # ---------------------------------------------------------
     chat_container = st.container()
-
-    # Mostrar historial visualmente
-    with chat_container:
-        if not st.session_state.messages:
-            st.info(f"Sistema en línea: {modo_seleccionado}")
-        
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                # Si el contenido es una lista (multimodal)...
-                if isinstance(message["content"], list):
-                    text_part = next((p for p in message["content"] if isinstance(p, str)), None)
-                    if text_part:
-                        st.markdown(text_part)
-                    else:
-                        st.markdown("🎤 *[Audio Enviado]*")
-                else:
-                    st.markdown(message["content"])
     
-    # 2. Área de Input (Micrófono y Texto)
-    st.divider()
+    # Historial
+    with chat_container:
+        for m in st.session_state.messages:
+            with st.chat_message(m["role"]):
+                content = m["content"]
+                if isinstance(content, list): st.write(content[0]) # Texto simple de lista
+                else: st.markdown(content)
+
+    # Input
     c1, c2 = st.columns([0.85, 0.15])
+    with c2: audio_input = mic_recorder(start_prompt="🎙️", stop_prompt="🛑", key='recorder', format="webm")
+    with c1: user_text = st.chat_input("Comando...")
 
-    with c2:
-        # El micrófono a la derecha (Columna pequeña)
-        audio_input = mic_recorder(
-            start_prompt="🎙️", 
-            stop_prompt="🛑", 
-            key='recorder', 
-            format="webm" 
-        )
-
-    with c1:
-        # El texto a la izquierda (Columna grande)
-        user_text = st.chat_input("Escribe tu comando aquí...", key="chat_principal_unico")
-
-# --- PESTAÑA 2: PROYECTOS ---
 with tab_proyectos:
     gestor_de_proyectos()
 
-# --- LÓGICA DE PROCESAMIENTO (CEREBRO) ---
-process_interaction = False
-user_content = [] # La lista que enviaremos a Gemini
+# Procesamiento
+user_content = []
+process = False
 
-# 1. Detectar si hay texto nuevo
 if user_text:
     user_content.append(user_text)
-    process_interaction = True
+    process = True
 
-# 2. Detectar si hay audio nuevo (CON HASH CHECK)
 if audio_input:
-    # A. Extraemos los bytes (Corrección del KeyError)
-    audio_bytes = audio_input['bytes'] 
-    
-    # B. Calculamos la huella digital (Hash MD5)
+    audio_bytes = audio_input['bytes']
     current_hash = hashlib.md5(audio_bytes).hexdigest()
-    
-    # C. Comparamos con la última huella guardada
     if current_hash != st.session_state.last_audio_hash:
-        # ¡Es un audio nuevo! Actualizamos la huella y procesamos
         st.session_state.last_audio_hash = current_hash
-        
-        # Empaquetamos el audio para Gemini
-        audio_blob = {
-            "mime_type": "audio/webm",
-            "data": audio_bytes
-        }
-        user_content.append(audio_blob)
-        process_interaction = True
-        st.toast("👂 Audio Nuevo Recibido")
-    else:
-        # Es el mismo audio de antes (Ghost Audio), lo ignoramos silenciosamente
-        pass
+        user_content.append({"mime_type": "audio/webm", "data": audio_bytes})
+        process = True
 
-# --- LÓGICA DE PROCESAMIENTO MULTIMODAL MEJORADA ---
-if process_interaction:
-    # 1. Creamos una copia para el Modelo (Payload) y dejamos user_content limpio para la UI
+if process:
+    # Preparar contexto
     model_payload = user_content.copy()
-
-    # A. Inyectar Contexto de Documentos (Solo al Payload del modelo)
-    if st.session_state.doc_text:
-        # 💡 CAMBIO CLAVE: Instrucción Pasiva (para que no resuma siempre)
-        instruccion_doc = (
-            f"\n\n[CONTEXTO DE FONDO - NO RESUMIR A MENOS QUE SE PIDA]:\n"
-            f"El usuario tiene este documento cargado en RAM.\n"
-            f"Úsalo SOLO si la pregunta actual lo requiere explícitamente.\n"
-            f"CONTENIDO:\n{st.session_state.doc_text}"
-        )
-        
-        # Insertamos en la copia que va para Gemini
-        if model_payload and isinstance(model_payload[0], str):
-            model_payload[0] += instruccion_doc
-        else:
-            model_payload.insert(0, instruccion_doc)
+    display_text = user_text if user_text else "🎤 [Audio]"
     
-    # B. Inyectar Imagen (Solo al Payload)
-    if st.session_state.image_data:
-        model_payload.append(st.session_state.image_data)
-        st.toast("👁️ Analizando imagen...")
-
-    # C. Mostrar mensaje LIMPIO en pantalla (Sin el texto del libro)
-    display_text = user_text if user_text else "🎤 *[Mensaje de Voz]*"
-    if st.session_state.doc_text: display_text += " 📎 *[Contexto Activo]*"
+    # Inyecciones
+    if st.session_state.doc_text: model_payload.insert(0, f"CONTEXTO PDF: {st.session_state.doc_text}")
+    if st.session_state.image_data: model_payload.append(st.session_state.image_data)
     
-    with chat_container:
-        st.chat_message("user").markdown(display_text)
-    
-    # Guardamos en historial la versión LIMPIA
+    # UI Update
     st.session_state.messages.append({"role": "user", "content": display_text})
+    with chat_container: st.chat_message("user").markdown(display_text)
     save_message("user", display_text)
 
-   # D. INVOCAR A GEMINI
+    # Gemini Call
     try:
-        # 1. Configuración del Modelo
+        # Usamos credenciales si existen, si no, intentamos API KEY (fallback)
+        if creds:
+             # Vertex AI Init ya se hizo arriba
+             pass 
+        else:
+             # Fallback a API Key si no hay token (solo texto)
+             genai.configure(api_key=st.secrets.get("GOOGLE_API_KEY"))
+
         model = genai.GenerativeModel(
             model_name=selected_model,
-            system_instruction=ACTIVE_SYSTEM_PROMPT, 
+            system_instruction = ACTIVE_SYSTEM_PROMPT + f"\nMEMORIA: {st.session_state.core_memory_cache}",
             tools=mis_herramientas
         )
-
-        # 2. Preparar Historial (Solo texto para evitar errores de serialización)
-        history_gemini = []
-        for m in st.session_state.messages[:-1]:
-            content_str = ""
-            if isinstance(m["content"], list):
-                for p in m["content"]:
-                    if isinstance(p, str): content_str += p
-            elif isinstance(m["content"], str):
-                content_str = m["content"]
-            
-            if content_str:
-                history_gemini.append({"role": "user" if m["role"] == "user" else "model", "parts": [content_str]})
-
-        # 3. Iniciar Chat
-        chat = model.start_chat(history=history_gemini)
         
-        with st.spinner("⚡ Procesando..."):
-            response = chat.send_message(user_content)
+        # Historial simple para API
+        history = [{"role": m["role"], "parts": [m["content"]]} for m in st.session_state.messages if isinstance(m["content"], str)]
+        chat = model.start_chat(history=history)
+        
+        with st.spinner("⚡ Pensando..."):
+            response = chat.send_message(model_payload)
             
             final_text = ""
-            function_handled = False
             
-            # 4. ANÁLISIS DE LA RESPUESTA (Lógica Blindada v2)
+            # Procesamiento de Tools
             if response.parts:
                 for part in response.parts:
-                    
-                    # CASO A: Es una llamada a función (Calendar)
                     if fn := part.function_call:
-                        function_handled = True
-                        args = {key: val for key, val in fn.args.items()}
-
-                        with st.status(f"⚙️ Ejecutando protocolo: {fn.name}...", expanded=True) as s:
-                            s.write(f"📦 Datos extraídos: {args}")
-                            
-                            # EL DESPACHADOR DINÁMICO
-                            if fn.name in mapa_herramientas:
-                                # 1. Busca la función en el diccionario y la ejecuta con los argumentos
-                                funcion_a_ejecutar = mapa_herramientas[fn.name]
-                                res = funcion_a_ejecutar(**args)
+                        args = {k: v for k, v in fn.args.items()}
+                        # Ejecución dinámica
+                        func = globals().get(fn.name)
+                        if func:
+                            with st.status(f"⚙️ {fn.name}...", expanded=True) as s:
+                                res = func(**args)
+                                s.write(res); s.update(state="complete")
                                 
-                                s.write(f"Resultado: {res}")
-                                s.update(label="✅ Operación completada", state="complete")
-                                
-                                # 2. Devolvemos el resultado a Gemini
-                                try:
-                                    response_parts = [
-                                        genai.protos.Part(
-                                            function_response=genai.protos.FunctionResponse(
-                                                name=fn.name, # Nombre dinámico
-                                                response={"result": res}
-                                            )
-                                        )
-                                    ]
-                                    final_response = chat.send_message(response_parts)
-                                    final_text = final_response.text
-                                except Exception as e:
-                                    final_text = f"✅ Protocolo ejecutado, pero hubo un error en la síntesis verbal: {e}"
-                            else:
-                                s.update(label="❌ Herramienta desconocida", state="error")
-                                final_text = f"⚠️ Intenté usar una herramienta inexistente: {fn.name}"
-       
-                    # CASO B: Es texto normal (Respuesta directa)
+                                # Respuesta a la herramienta
+                                response_parts = [genai.protos.Part(function_response=genai.protos.FunctionResponse(name=fn.name, response={"result": res}))]
+                                final_res = chat.send_message(response_parts)
+                                final_text = final_res.text
+                        else: final_text = f"Error: Herramienta {fn.name} no encontrada."
                     elif part.text:
                         final_text += part.text
 
-            # Si por alguna razón la respuesta quedó vacía
-            if not final_text and not function_handled:
-                final_text = "⚠️ Gemini recibió la orden, pero envió una respuesta vacía."
-
-       # F. Mostrar Respuesta Final, Imagen y Audio
-        with chat_container:
-            with st.chat_message("assistant"):
-                # 1. Mostrar Texto
-                st.markdown(final_text)
-
-                # 2. --- VISUALIZADOR DE IMÁGENES (PERSISTENTE) ---
+            # Mostrar Respuesta
+            with chat_container:
+                st.chat_message("assistant").markdown(final_text)
                 if st.session_state.generated_image_cache:
-                    st.toast("📸 Fotografía revelada")
-                    
-                    # Mostramos la imagen
-                    st.image(
-                        st.session_state.generated_image_cache._pil_image, 
-                        caption="Generado por Angel OS | Estilo Nano Bananas Pro", 
-                        use_column_width=True
-                    )
-                    
-                    # Botón MANUAL para cerrar la foto (no automático)
-                    if st.button("❌ Cerrar Fotografía", key="close_img_btn"):
-                        st.session_state.generated_image_cache = None
-                        st.rerun()
-                
-                # 3. --- SISTEMA DE VOZ NEURAL (EDGE-TTS) ---
-                if final_text:
-                    try:
-                        VOZ_NEURAL = "es-MX-JorgeNeural"
-                        archivo_audio = "respuesta_jarvis.mp3"
-                        
-                        async def generar_voz():
-                            communicate = edge_tts.Communicate(final_text, VOZ_NEURAL)
-                            await communicate.save(archivo_audio)
+                    st.image(st.session_state.generated_image_cache._pil_image, caption="Generado por Jarvis")
+                    if st.button("❌ Cerrar Foto"): st.session_state.generated_image_cache = None; st.rerun()
 
-                        try:
-                            loop = asyncio.get_event_loop()
-                        except RuntimeError:
-                            loop = asyncio.new_event_loop()
-                            asyncio.set_event_loop(loop)
-                        
-                        if loop.is_running():
-                            asyncio.run_coroutine_threadsafe(generar_voz(), loop)
-                        else:
-                            loop.run_until_complete(generar_voz())
-                        
-                        st.audio(archivo_audio, format='audio/mp3')
-                        
-                    except Exception as e:
-                        print(f"⚠️ Error voz neural: {e}")
+            st.session_state.messages.append({"role": "assistant", "content": final_text})
+            save_message("assistant", final_text)
 
-        # --- GUARDADO Y LIMPIEZA ---
-        
-        # 1. Guardar en Historial
-        st.session_state.messages.append({"role": "assistant", "content": final_text})
-        save_message("assistant", final_text)
-        
-        # 2. Lógica de Limpieza (SOLO PARA INPUTS, NO PARA LA FOTO)
-        should_rerun = False
-        
-        # Limpiamos inputs de imagen del usuario (lo que tú subes)
-        if st.session_state.image_data:
-            st.session_state.image_data = None
-            should_rerun = True
-        
-        # Solo recargamos si hubo limpieza de tus archivos subidos
-        if should_rerun:
-            time.sleep(0.5)
-            st.rerun()
+            # Audio TTS
+            if final_text:
+                async def text_to_speech():
+                    communicate = edge_tts.Communicate(final_text, "es-MX-JorgeNeural")
+                    await communicate.save("response.mp3")
+                try:
+                    loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+                    loop.run_until_complete(text_to_speech())
+                    st.audio("response.mp3", format="audio/mp3", autoplay=True)
+                except: pass
 
     except Exception as e:
-        # Imprimimos el error completo para debuggear si vuelve a pasar
-        import traceback
-        st.error(f"❌ Error Crítico: {e}")
-        with st.expander("Ver detalles técnicos"):
-            st.code(traceback.format_exc())
-
-if st.button("🧪 PROBAR CONEXIÓN CALENDARIO", key="boton_prueba_clon"):
-
-    test_calendar_connection()
-
-
+        st.error(f"Error: {e}")
