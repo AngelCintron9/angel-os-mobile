@@ -54,48 +54,45 @@ SCOPES = [
 ]
 
 @st.cache_resource
-def get_db_credentials():
-    """Recupera el Token de forma segura."""
-    # Verificamos si existe el secreto
-    if "token_json" not in st.secrets:
-        return None
-        
-    try:
-        json_str = st.secrets["token_json"]["json_content"]
-        token_info = json.loads(json_str)
-        
-        # 2. Reconstruimos la credencial
-        creds = Credentials.from_authorized_user_info(info=token_info, scopes=SCOPES)
-        
-        # 3. Auto-Refresco (Vital para que Jarvis no muera en 1 hora)
-        if creds and creds.expired and creds.refresh_token:
-            from google.auth.transport.requests import Request
-            try:
+def get_credentials():
+    """Intenta recuperar el Token Maestro de los Secrets."""
+    if "token_json" in st.secrets:
+        try:
+            # Opción A: Formato TOML correcto (con json_content)
+            if "json_content" in st.secrets["token_json"]:
+                json_str = st.secrets["token_json"]["json_content"]
+                token_info = json.loads(json_str)
+                creds = Credentials.from_authorized_user_info(info=token_info, scopes=SCOPES)
+            # Opción B: Formato directo (si copiaste las claves sueltas)
+            else:
+                # Intentar reconstruir desde claves sueltas
+                token_info = {k: v for k, v in st.secrets["token_json"].items()}
+                creds = Credentials.from_authorized_user_info(info=token_info, scopes=SCOPES)
+
+            if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
-                # print("🔄 Token refrescado automáticamente")
-            except Exception as e:
-                st.error(f"⚠️ Error refrescando token: {e}")
-        
-        return creds
-    except Exception as e:
-        st.error(f"❌ Error procesando el Token Maestro: {e}")
-        return None
+            return creds
+        except Exception as e:
+            print(f"Error Token: {e}")
+            return None
+    return None
 
 # --- INICIALIZAR SERVICIOS ---
-creds_db = get_db_credentials() # Credenciales complejas para DB
+creds_db = get_credentials() # Credenciales complejas para DB
 api_key = st.secrets.get("GOOGLE_API_KEY") # Clave simple para Chat
 
 # 1. Firestore (Base de Datos)
 db = None
-if creds_db:
+if creds:
     try:
-        db = firestore.Client(credentials=creds_db, project=PROJECT_ID)
-    except Exception as e: st.error(f"Error conectando DB: {e}")
+        db = firestore.Client(credentials=creds, project=PROJECT_ID)
+    except Exception as e: 
+        print(f"Error DB: {e}")
 
 # 2. Vertex AI (Solo para generar imágenes)
-if creds_db:
+if creds:
     try:
-        vertexai.init(project=PROJECT_ID, location="us-central1", credentials=creds_db)
+        vertexai.init(project=PROJECT_ID, location="us-central1", credentials=creds)
     except: pass
 
 # 3. Configurar Chat (Gemini) - Usamos API Key por velocidad
@@ -458,31 +455,35 @@ with st.sidebar:
     st.header("🎛️ Centro de Control")
     st.sidebar.info(f"🕒 {fecha_ui}")
     
-    # Auth simple por contraseña
+    # DIAGNÓSTICO DE CONEXIÓN
+    if creds and db:
+        st.success("🟢 SISTEMA TOTALMENTE OPERATIVO")
+    elif creds and not db:
+        st.warning("⚠️ Token OK, pero DB falla (API Firestore apagada?)")
+    else:
+        st.error("🔴 SIN CONEXIÓN A DB (Revisa Secrets)")
+        if st.checkbox("Ver ayuda de Secrets"):
+            st.code("""[token_json]
+json_content = \"\"\"
+{
+  "token": "...",
+  ...
+}
+\"\"\" """, language="toml")
+
+    # Auth Password
     if "authenticated" not in st.session_state: st.session_state.authenticated = False
-    
-    # Recuperamos password de secrets o environment
     secret_pass = st.secrets.get("JARVIS_PASSWORD", os.environ.get("JARVIS_PASSWORD"))
-    
     if secret_pass and not st.session_state.authenticated:
         pwd = st.text_input("Acceso:", type="password")
         if pwd == secret_pass: st.session_state.authenticated = True; st.rerun()
-        elif pwd: st.error("❌ Acceso Denegado")
         st.stop()
-    
-    st.success("🔓 Sistema Activo")
-    if st.button("🔒 Bloquear"): st.session_state.authenticated = False; st.rerun()
 
-    # A. SELECTOR DE CEREBRO
-    modo_seleccionado = st.radio(
-        "Modo Activo:",
-        ["🛡️ JARVIS", "💼 SOCIO"],
-        index=0
-    )
-    
-    # Determinamos el Prompt Activo
+    modo_seleccionado = st.radio("Modo:", ["🛡️ JARVIS", "💼 SOCIO"])
     PROMPT_BASE = PROMPT_JARVIS if "JARVIS" in modo_seleccionado else PROMPT_SOCIO
 
+# te quedaste aqui
+    
     # Le inyectamos la memoria tatuada
     memoria_actual = st.session_state.core_memory_cache if st.session_state.core_memory_cache else "Sin recuerdos aún."
     CONTEXTO_MEMORIA = f"\n\n=== MEMORIA CENTRAL (LO QUE SABES DE ANGEL) ==={st.session_state.core_memory_cache}\n======================================"
@@ -644,5 +645,6 @@ if process:
 
     except Exception as e:
         st.error(f"Error: {e}")
+
 
 
