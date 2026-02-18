@@ -1,22 +1,35 @@
 import streamlit as st
-import google.generativeai as genai
-from google.cloud import firestore
-import vertexai
-from vertexai.preview.vision_models import ImageGenerationModel
 import os
 import time
 import json
-from PIL import Image
-import pypdf
-from streamlit_mic_recorder import mic_recorder
-import google.auth
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
 import hashlib
 import asyncio
-import edge_tts
-from datetime import datetime, timezone, timedelta
 import pandas as pd
+from datetime import datetime, timezone, timedelta
+from PIL import Image
+
+# --- IMPORTACIONES DE GOOGLE (CRÍTICAS) ---
+try:
+    import google.generativeai as genai
+    import google.auth
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    from google.cloud import firestore
+    from google.auth.transport.requests import Request
+    # Intentamos importar Vertex AI de forma segura
+    import vertexai
+    from vertexai.preview.vision_models import ImageGenerationModel
+except ImportError as e:
+    st.error(f"❌ Error de Librerías: {e}. Revisa requirements.txt")
+    st.stop()
+
+# --- IMPORTACIONES DE TERCEROS ---
+try:
+    from streamlit_mic_recorder import mic_recorder
+    import edge_tts
+    import pypdf
+except ImportError:
+    st.warning("⚠️ Faltan librerías de audio/PDF. Algunas funciones no irán.")
 
 # ---------------------------------------------------------
 # 1. CONFIGURACIÓN INICIAL
@@ -41,32 +54,32 @@ SCOPES = [
 ]
 
 @st.cache_resource
-def get_google_credentials():
-    """
-    Recupera la 'Llave Maestra' desde los Secretos de Streamlit.
-    Esta credencial sirve para: Calendar, Firestore y Vertex AI.
-    """
-    if "token_json" in st.secrets:
-        try:
-            json_str = st.secrets["token_json"]["json_content"]
-            token_info = json.loads(json_str)
-            
-            # 2. Reconstruimos la credencial
-            creds = Credentials.from_authorized_user_info(info=token_info, scopes=SCOPES)
-            
-            # 3. Auto-Refresco (Vital para que Jarvis no muera en 1 hora)
-            if creds and creds.expired and creds.refresh_token:
-                from google.auth.transport.requests import Request
-                try:
-                    creds.refresh(Request())
-                    # print("🔄 Token refrescado automáticamente")
-                except Exception as e:
-                    st.error(f"⚠️ Error refrescando token: {e}")
-            
-            return creds
-        except Exception as e:
-            st.error(f"❌ Error procesando el Token Maestro: {e}")
-            return None
+def get_db_credentials():
+    """Recupera el Token de forma segura."""
+    # Verificamos si existe el secreto
+    if "token_json" not in st.secrets:
+        return None
+        
+    try:
+        json_str = st.secrets["token_json"]["json_content"]
+        token_info = json.loads(json_str)
+        
+        # 2. Reconstruimos la credencial
+        creds = Credentials.from_authorized_user_info(info=token_info, scopes=SCOPES)
+        
+        # 3. Auto-Refresco (Vital para que Jarvis no muera en 1 hora)
+        if creds and creds.expired and creds.refresh_token:
+            from google.auth.transport.requests import Request
+            try:
+                creds.refresh(Request())
+                # print("🔄 Token refrescado automáticamente")
+            except Exception as e:
+                st.error(f"⚠️ Error refrescando token: {e}")
+        
+        return creds
+    except Exception as e:
+        st.error(f"❌ Error procesando el Token Maestro: {e}")
+        return None
     
     # Fallback para desarrollo local (si tienes el archivo token.json en la carpeta)
     elif os.path.exists("token.json"):
@@ -637,3 +650,4 @@ if process:
 
     except Exception as e:
         st.error(f"Error: {e}")
+
