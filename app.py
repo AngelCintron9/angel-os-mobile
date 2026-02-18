@@ -78,7 +78,7 @@ def get_credentials():
     return None
 
 # --- INICIALIZAR SERVICIOS ---
-creds_db = get_credentials() # Credenciales complejas para DB
+creds = get_credentials() # Credenciales complejas para DB
 api_key = st.secrets.get("GOOGLE_API_KEY") # Clave simple para Chat
 
 # 1. Firestore (Base de Datos)
@@ -564,3 +564,4 @@ if prompt:
 
     except Exception as e:
         st.error(f"Error: {e}")
+
