@@ -500,9 +500,33 @@ json_content = \"\"\"
 # ---------------------------------------------------------
 # 7. LOGICA PRINCIPAL (CHAT + TABS)
 # ---------------------------------------------------------
+tab_chat, tab_proyectos = st.tabs(["💬 Chat", "📊 Proyectos"])
+
+# 1. PRE-DEFINIR VARIABLES (Esto elimina el NameError para siempre)
+user_text = None
+audio_input = None
 prompt = None
-if user_text: prompt = user_text
-if audio_input and audio_input['bytes']:
+
+with tab_chat:
+    chat_container = st.container()
+    for m in st.session_state.messages:
+        with chat_container.chat_message(m["role"]):
+            content = m["content"]
+            if isinstance(content, list): st.write(content[0])
+            else: st.markdown(content)
+
+    # 2. EL MICRÓFONO Y EL TEXTO SEPARADOS DE LAS COLUMNAS
+    audio_input = mic_recorder(start_prompt="🎙️ Grabar Audio", stop_prompt="🛑 Detener", key='recorder')
+    user_text = st.chat_input("Escribe tu comando Jarvis...")
+
+with tab_proyectos:
+    gestor_de_proyectos()
+
+# --- LÓGICA CHAT ---
+# 3. ASIGNACIÓN SEGURA
+if user_text: 
+    prompt = user_text
+elif audio_input and audio_input['bytes']:
     current_hash = hashlib.md5(audio_input['bytes']).hexdigest()
     if current_hash != st.session_state.last_audio_hash:
         st.session_state.last_audio_hash = current_hash
@@ -524,7 +548,7 @@ if prompt:
         model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=FULL_PROMPT, tools=mis_herramientas)
         history = [{"role": m["role"], "parts": [m["content"]]} for m in st.session_state.messages if isinstance(m["content"], str)]
         chat = model.start_chat(history=history)
-
+        
         with st.spinner("⚡ Procesando..."):
             response = chat.send_message(model_payload)
             final_text = ""
@@ -564,4 +588,3 @@ if prompt:
 
     except Exception as e:
         st.error(f"Error: {e}")
-
