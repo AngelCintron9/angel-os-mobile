@@ -53,28 +53,31 @@ SCOPES = [
     'https://www.googleapis.com/auth/cloud-platform'
 ]
 
+token_error_msg = None
+db_error_msg = None
+
 @st.cache_resource
 def get_credentials():
-    """Intenta recuperar el Token Maestro de los Secrets."""
+    global token_error_msg
     if "token_json" in st.secrets:
         try:
-            # Opción A: Formato TOML correcto (con json_content)
+            # Opción A: Formato con json_content
             if "json_content" in st.secrets["token_json"]:
                 json_str = st.secrets["token_json"]["json_content"]
                 token_info = json.loads(json_str)
-                creds = Credentials.from_authorized_user_info(info=token_info, scopes=SCOPES)
-            # Opción B: Formato directo (si copiaste las claves sueltas)
+            # Opción B: Formato de diccionario directo
             else:
-                # Intentar reconstruir desde claves sueltas
                 token_info = {k: v for k, v in st.secrets["token_json"].items()}
-                creds = Credentials.from_authorized_user_info(info=token_info, scopes=SCOPES)
-
+                
+            creds = Credentials.from_authorized_user_info(info=token_info, scopes=SCOPES)
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
             return creds
         except Exception as e:
-            print(f"Error Token: {e}")
+            token_error_msg = str(e)
             return None
+    else:
+        token_error_msg = "No se encontró [token_json] en los Secrets."
     return None
 
 # --- INICIALIZAR SERVICIOS ---
@@ -87,15 +90,13 @@ if creds:
     try:
         db = firestore.Client(credentials=creds, project=PROJECT_ID)
     except Exception as e: 
-        print(f"Error DB: {e}")
+        db_error_msg = str(e)
 
-# 2. Vertex AI (Solo para generar imágenes)
 if creds:
     try:
         vertexai.init(project=PROJECT_ID, location="us-central1", credentials=creds)
     except: pass
 
-# 3. Configurar Chat (Gemini) - Usamos API Key por velocidad
 if api_key:
     genai.configure(api_key=api_key)
 else:
@@ -453,24 +454,19 @@ Si el usuario sube un libro o documento de más de 10 páginas:
 
 with st.sidebar:
     st.header("🎛️ Centro de Control")
-    st.sidebar.info(f"🕒 {fecha_ui}")
+    st.info(f"🕒 {fecha_ui}")
     
-    # DIAGNÓSTICO DE CONEXIÓN
+    # 🕵️‍♂️ DETECTOR DE ERRORES DE CONEXIÓN
     if creds and db:
         st.success("🟢 SISTEMA TOTALMENTE OPERATIVO")
-    elif creds and not db:
-        st.warning("⚠️ Token OK, pero DB falla (API Firestore apagada?)")
     else:
-        st.error("🔴 SIN CONEXIÓN A DB (Revisa Secrets)")
-        if st.checkbox("Ver ayuda de Secrets"):
-            st.code("""[token_json]
-json_content = \"\"\"
-{
-  "token": "...",
-  ...
-}
-\"\"\" """, language="toml")
+        st.error("🔴 SIN CONEXIÓN A DB")
+        with st.expander("🔍 Ver Detalles del Error"):
+            if token_error_msg: st.write(f"**Error de Token:** {token_error_msg}")
+            if db_error_msg: st.write(f"**Error de Firestore:** {db_error_msg}")
 
+    st.divider()
+    
     # Auth Password
     if "authenticated" not in st.session_state: st.session_state.authenticated = False
     secret_pass = st.secrets.get("JARVIS_PASSWORD", os.environ.get("JARVIS_PASSWORD"))
@@ -479,6 +475,12 @@ json_content = \"\"\"
         if pwd == secret_pass: st.session_state.authenticated = True; st.rerun()
         st.stop()
 
+    # 🔄 SELECTOR DE MODELOS (RECUPERADO)
+    model_options = genai.list_models()
+    selected_model = st.selectbox("Modelo Neural:", model_options, index=0)
+
+    st.divider()
+    
     modo_seleccionado = st.radio("Modo:", ["🛡️ JARVIS", "💼 SOCIO"])
     PROMPT_BASE = PROMPT_JARVIS if "JARVIS" in modo_seleccionado else PROMPT_SOCIO
     
@@ -502,7 +504,6 @@ json_content = \"\"\"
 # ---------------------------------------------------------
 tab_chat, tab_proyectos = st.tabs(["💬 Chat", "📊 Proyectos"])
 
-# 1. PRE-DEFINIR VARIABLES (Esto elimina el NameError para siempre)
 user_text = None
 audio_input = None
 prompt = None
@@ -515,15 +516,21 @@ with tab_chat:
             if isinstance(content, list): st.write(content[0])
             else: st.markdown(content)
 
-    # 2. EL MICRÓFONO Y EL TEXTO SEPARADOS DE LAS COLUMNAS
-    audio_input = mic_recorder(start_prompt="🎙️ Grabar Audio", stop_prompt="🛑 Detener", key='recorder')
+    st.markdown("---")
+    # Acomodamos el micrófono limpiamente en una pequeña columna a la izquierda
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        audio_input = mic_recorder(start_prompt="🎙️ Grabar Audio", stop_prompt="🛑 Detener", key='recorder')
+    
+    # El campo de texto SIEMPRE debe ir suelto (fuera de columnas)
     user_text = st.chat_input("Escribe tu comando Jarvis...")
 
 with tab_proyectos:
     gestor_de_proyectos()
 
-# --- LÓGICA CHAT ---
-# 3. ASIGNACIÓN SEGURA
+# ---------------------------------------------------------
+# 6. PROCESAMIENTO
+# ---------------------------------------------------------
 if user_text: 
     prompt = user_text
 elif audio_input and audio_input['bytes']:
@@ -545,7 +552,8 @@ if prompt:
         
         FULL_PROMPT = PROMPT_BASE + f"\n\nMEMORIA VITAL:\n{st.session_state.core_memory_cache}"
         
-        model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=FULL_PROMPT, tools=mis_herramientas)
+        # 🔄 USANDO EL MODELO SELECCIONADO
+        model = genai.GenerativeModel(selected_model, system_instruction=FULL_PROMPT, tools=mis_herramientas)
         history = [{"role": m["role"], "parts": [m["content"]]} for m in st.session_state.messages if isinstance(m["content"], str)]
         chat = model.start_chat(history=history)
         
@@ -570,7 +578,6 @@ if prompt:
             with chat_container.chat_message("assistant"): st.markdown(final_text)
             st.session_state.messages.append({"role": "assistant", "content": final_text})
             
-            # Guardar historial (solo si hay DB)
             if db:
                 try:
                     doc_ref = db.collection("conversaciones").document("historial_v1")
